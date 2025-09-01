@@ -72,3 +72,7 @@ If our work is helpful to you, please kindly cite our paper as:
 }
 ```
 
+## PMData Resources
+
+- Guide: `docs/PMData_README.md`
+- Notebook: `notebooks/PMData_Prompt_Generation.ipynb`
