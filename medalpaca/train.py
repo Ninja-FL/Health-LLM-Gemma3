@@ -1,8 +1,9 @@
 import os
 import sys
-from typing import Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import fire
+import inspect
 import torch
 from datasets import load_dataset
 from handler import DataHandler
@@ -10,8 +11,9 @@ from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
+    prepare_model_for_kbit_training,
 )
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -22,9 +24,15 @@ from transformers import (
     TrainingArguments,
 )
 
+try:
+    # Optional import for modern quantization API
+    from transformers import BitsAndBytesConfig
+except Exception:  # pragma: no cover
+    BitsAndBytesConfig = None
+
 
 def main(
-    model: str, # e.g. "decapoda-research/llama-7b-hf"
+    model: str,  # e.g. "decapoda-research/llama-7b-hf"
     val_set_size: Union[int, float] = 0.1,
     prompt_template: str = "prompts/medalpaca.json",
     model_max_length: int = 256,  # should not exceed 2048, as LLaMA is trained with this
@@ -53,10 +61,11 @@ def main(
     fp16: bool = True,
     bf16: bool = False,
     gradient_checkpointing: bool = False,
+    gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
     warmup_steps: int = 100,
     fsdp: str = "full_shard auto_wrap",
     fsdp_transformer_layer_cls_to_wrap: str = "LlamaDecoderLayer",
-    **kwargs
+    **kwargs,
 ):
     """
     Trains a large language model using HuggingFace Transformers with custom configuration options.
@@ -168,15 +177,38 @@ def main(
     # loading the model with torch_dtype=torch.float16 with only fp16 and no LoRA leads
     # to `ValueError: Attempting to unscale FP16 gradients.`
 
+    quantization_config = None
+    if train_in_8bit:
+        if BitsAndBytesConfig is None:
+            raise ImportError(
+                "8-bit loading requires transformers>=4.40 with BitsAndBytesConfig and bitsandbytes. "
+                "Please upgrade: `pip install -U transformers bitsandbytes`."
+            )
+        try:
+            quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "Using 8-bit quantization requires a recent bitsandbytes. "
+                "Upgrade: `pip install -U bitsandbytes`"
+            ) from e
+
+    dtype = torch.float16 if any([use_lora, bf16]) else torch.float32
+    extra_model_kwargs = {}
+    if "gemma" in model_name.lower():
+        # Gemma 3 recommends eager attention implementation
+        extra_model_kwargs["attn_implementation"] = "eager"
+
     model = load_model.from_pretrained(
         model_name,
-        load_in_8bit=train_in_8bit,
-        torch_dtype=torch.float16 if any([use_lora, bf16]) else torch.float32,
+        quantization_config=quantization_config,
+        dtype=dtype,
         device_map=device_map,
+        trust_remote_code=True,
+        **extra_model_kwargs,
     )
 
     if train_in_8bit:
-        model = prepare_model_for_int8_training(model)
+        model = prepare_model_for_kbit_training(model)
 
     if use_lora:
         lora_config = LoraConfig(
@@ -194,8 +226,11 @@ def main(
     if "llama" in model_name.lower():
         tokenizer = LlamaTokenizer.from_pretrained(model_name)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token_id = 0
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, use_fast=True, trust_remote_code=True
+        )
+    if getattr(tokenizer, "pad_token_id", None) is None or tokenizer.pad_token_id == -1:
+        tokenizer.pad_token_id = getattr(tokenizer, "eos_token_id", 0) or 0
     tokenizer.padding_side = "left"
 
     # load and tokenize data
@@ -222,10 +257,15 @@ def main(
         model.model_parallel = True
 
     # init trainer
-    training_args = TrainingArguments(
+    # Build TrainingArguments with compatibility across transformers versions
+    if gradient_checkpointing and gradient_checkpointing_kwargs is None:
+        gradient_checkpointing_kwargs = {"use_reentrant": False}
+
+    ta_kwargs = dict(
         per_device_train_batch_size=per_device_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         gradient_checkpointing=gradient_checkpointing,
+        gradient_checkpointing_kwargs=gradient_checkpointing_kwargs,
         warmup_steps=warmup_steps,
         num_train_epochs=num_epochs,
         learning_rate=learning_rate,
@@ -234,21 +274,50 @@ def main(
         logging_steps=10,
         optim=optim,
         lr_scheduler_type=lr_scheduler_type,
-        evaluation_strategy="steps" if val_set_size > 0 else "no",
-        save_strategy="steps",
-        eval_steps=eval_steps if val_set_size > 0 else None,
-        save_steps=eval_steps,
         output_dir=output_dir,
         save_total_limit=save_total_limit,
-        load_best_model_at_end=True if val_set_size > 0 else False,
         ddp_find_unused_parameters=False if ddp else None,
         group_by_length=group_by_length,
         report_to="wandb" if use_wandb else None,
         run_name=wandb_run_name if use_wandb else None,
         fsdp=fsdp,
         fsdp_transformer_layer_cls_to_wrap=fsdp_transformer_layer_cls_to_wrap,
-        **kwargs
     )
+    # Merge any extra kwargs provided by caller
+    ta_kwargs.update(kwargs)
+    # Filter unsupported arguments for older transformers versions
+    try:
+        accepted = set(inspect.signature(TrainingArguments.__init__).parameters.keys())
+    except (ValueError, TypeError):  # pragma: no cover
+        accepted = set()
+    # print(f"Aligned arguments (accepted): {accepted}")
+    
+    # Configure evaluation/save strategy only if supported and if validation is present
+    eval_strategy_key = next(
+        (key for key in ("eval_strategy", "evaluation_strategy") if key in accepted),
+        None,
+    )
+    save_strategy_key = "save_strategy" if "save_strategy" in accepted else None
+
+    if val_set_size and val_set_size > 0 and eval_strategy_key and save_strategy_key:
+        ta_kwargs[eval_strategy_key] = "steps"
+        ta_kwargs[save_strategy_key] = "steps"
+        if "eval_steps" in accepted:
+            ta_kwargs["eval_steps"] = eval_steps
+        if "save_steps" in accepted:
+            ta_kwargs["save_steps"] = eval_steps
+        if "load_best_model_at_end" in accepted:
+            ta_kwargs["load_best_model_at_end"] = True
+    else:
+        # Remove eval/save args if not supported to avoid mismatches
+        for k in ["eval_strategy", "evaluation_strategy", "save_strategy", "eval_steps", "save_steps"]:
+            ta_kwargs.pop(k, None)
+        if "load_best_model_at_end" in accepted:
+            ta_kwargs["load_best_model_at_end"] = False
+    filtered = {k: v for k, v in ta_kwargs.items() if k in accepted}
+    training_args = TrainingArguments(**filtered)
+    final_args = {key: getattr(training_args, key) for key in filtered}
+    print(f"Final filtered TrainingArguments: {final_args}")
 
     trainer = Trainer(
         model=model,

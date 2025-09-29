@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 
 MODE = "train"
-DATA = "LifeSnaps" # "PMData", "GLOBEM", "AW_FB"
+DATA = "PMData"  # "PMData", "GLOBEM", "AW_FB", "LifeSnaps"
 
 
 def avg(_list):
@@ -331,18 +331,17 @@ if MODE == "train":
             3) Calorie Consumption Prediction (food image) 
             4) Sleep Quality Prediction
         """
-        participant_info = {
-            'p1': [-1, -1, 'N/A', 'N/A', 'N/A']
-        }
-        
-        DATA_PATH = "medAlpaca/data/pmdata"
-        SUBTASK = "sleep_quality" # ['sleep_quality', 'stress', 'readiness', 'fatigue']:
+        # minimal participant metadata placeholder for all directories
+        DATA_PATH = "medalpaca/data/pmdata"
+        # build placeholder participant info to avoid KeyError
+        participant_info = {d: [-1, -1, 'N/A', 'N/A', 'N/A'] for d in os.listdir(DATA_PATH) if '.' not in d}
+        SUBTASK = "stress"  # ['sleep_quality', 'stress', 'readiness', 'fatigue']
         final_data = []
         print("[INFO] Subtask:", SUBTASK)
         for dir1 in tqdm(os.listdir(DATA_PATH)):
             if "." in dir1:
                 continue
-            tmp = participant_info[dir1]
+            tmp = participant_info.get(dir1, [-1, -1, 'N/A', 'N/A', 'N/A'])
             age = tmp[0]
             height = str(tmp[1]) + " cm"
             gender = tmp[2]
@@ -834,5 +833,4 @@ if MODE == "train":
 
             
             
-
 

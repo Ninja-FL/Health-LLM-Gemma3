@@ -51,5 +51,11 @@
         "base_model": "decapoda-research/llama-65b-hf",
         "load_in_8bit": "True",
         "lora_model_id": "GerMedBERT/medalpaca-lora-65b-8bit"
+    },
+    "gemma-3-270m": {
+        "peft": "False",
+        "torch_dtype": "float16",
+        "base_model": "google/gemma-3-270m",
+        "load_in_8bit": "False"
     }
 }
